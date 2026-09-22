@@ -64,6 +64,44 @@ class PytreeTest(absltest.TestCase):
     attrs['units'] = 'degC'
     self.assertEqual(hashable_attrs['units'], 'K')
 
+  def test_hashable_attrs_nested_mapping_equality(self):
+    attrs1 = {
+        'metadata': {
+            'units': 'K',
+            'valid_range': np.array([180.0, 330.0]),
+        }
+    }
+    attrs2 = {
+        'metadata': {
+            'units': 'K',
+            'valid_range': np.array([180.0, 330.0]),
+        }
+    }
+    attrs3 = {
+        'metadata': {
+            'units': 'degC',
+            'valid_range': np.array([180.0, 330.0]),
+        }
+    }
+    attrs4 = {
+        'metadata': {
+            'units': 'K',
+            'valid_range': np.array([180.0, 331.0]),
+        }
+    }
+
+    wrapped1 = xarray_jax.pytree._HashableAttrs(attrs1)
+    wrapped2 = xarray_jax.pytree._HashableAttrs(attrs2)
+    wrapped3 = xarray_jax.pytree._HashableAttrs(attrs3)
+    wrapped4 = xarray_jax.pytree._HashableAttrs(attrs4)
+
+    self.assertEqual(wrapped1, wrapped2)
+    self.assertNotEqual(wrapped1, wrapped3)
+    self.assertNotEqual(wrapped1, wrapped4)
+    self.assertEqual(hash(wrapped1), hash(wrapped2))
+    hash(wrapped1)
+    hash(wrapped2)
+
   def test_flatten_unflatten_data_array(self):
     data_array = xarray_jax.DataArray(
         data=jnp.ones((3, 4), dtype=np.float32),
