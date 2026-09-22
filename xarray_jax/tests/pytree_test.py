@@ -25,58 +25,173 @@ import xarray_jax.pytree
 class PytreeTest(absltest.TestCase):
 
   def test_flatten_unflatten_variable(self):
+    attrs = {
+        'standard_name': 'air_temperature',
+        'units': 'K',
+        'valid_range': np.array([180.0, 330.0]),
+    }
     variable = xarray.Variable(
-        ('lat', 'lon'), jnp.ones((3, 4), dtype=np.float32))
+        ('lat', 'lon'), jnp.ones((3, 4), dtype=np.float32), attrs=attrs)
     children, aux = xarray_jax.pytree._flatten_variable(variable)
     # Check auxiliary info is hashable/comparable (important for jax.jit):
     hash(aux)
     self.assertEqual(aux, aux)
     roundtrip = xarray_jax.pytree._unflatten_variable(aux, children)
-    self.assertTrue(variable.equals(roundtrip))
+    self.assertTrue(variable.identical(roundtrip))
+
+  def test_hashable_attrs_array_aware_equality(self):
+    attrs = {
+        'units': 'K',
+        'valid_range': np.array([180.0, 330.0]),
+        'flags': [1, 2, 4],
+    }
+    hashable_attrs = xarray_jax.pytree._HashableAttrs(attrs)
+    equal_attrs = xarray_jax.pytree._HashableAttrs({
+        'units': 'K',
+        'valid_range': np.array([180.0, 330.0]),
+        'flags': [1, 2, 4],
+    })
+    different_attrs = xarray_jax.pytree._HashableAttrs({
+        'units': 'degC',
+        'valid_range': np.array([180.0, 330.0]),
+        'flags': [1, 2, 4],
+    })
+
+    self.assertEqual(hash(hashable_attrs), hash(equal_attrs))
+    self.assertEqual(hashable_attrs, equal_attrs)
+    self.assertNotEqual(hashable_attrs, different_attrs)
+
+    attrs['units'] = 'degC'
+    self.assertEqual(hashable_attrs['units'], 'K')
 
   def test_flatten_unflatten_data_array(self):
     data_array = xarray_jax.DataArray(
         data=jnp.ones((3, 4), dtype=np.float32),
         dims=('lat', 'lon'),
-        coords={'lat': np.arange(3)},
-        jax_coords={'lon': np.arange(4) * 10},
+        name='temperature',
+        attrs={'standard_name': 'air_temperature', 'units': 'K'},
+        coords={
+            'lat': xarray.Variable(
+                ('lat',), np.arange(3), attrs={'units': 'degrees_north'})},
+        jax_coords={
+            'lon': xarray.Variable(
+                ('lon',), jnp.arange(4) * 10,
+                attrs={'units': 'degrees_east'})},
     )
     children, aux = xarray_jax.pytree._flatten_data_array(data_array)
     # Check auxiliary info is hashable/comparable (important for jax.jit):
     hash(aux)
     self.assertEqual(aux, aux)
     roundtrip = xarray_jax.pytree._unflatten_data_array(aux, children)
-    self.assertTrue(data_array.equals(roundtrip))
+    self.assertTrue(data_array.identical(roundtrip))
+    xarray.testing.assert_identical(
+        jax.device_get(data_array), jax.device_get(roundtrip))
 
   def test_flatten_unflatten_dataset(self):
     foo = jnp.ones((3, 4), dtype=np.float32)
     bar = jnp.ones((2, 3, 4), dtype=np.float32)
     dataset = xarray_jax.Dataset(
-        data_vars={'foo': (('lat', 'lon'), foo),
-                   'bar': (('time', 'lat', 'lon'), bar)},
+        data_vars={
+            'foo': xarray.Variable(
+                ('lat', 'lon'), foo, attrs={'units': 'K'}),
+            'bar': xarray.Variable(
+                ('time', 'lat', 'lon'), bar,
+                attrs={'standard_name': 'air_temperature'})},
         coords={
-            'time': np.arange(2),
-            'lat': np.arange(3) * 10},
+            'time': xarray.Variable(
+                ('time',), np.arange(2), attrs={'axis': 'T'}),
+            'lat': xarray.Variable(
+                ('lat',), np.arange(3) * 10,
+                attrs={'units': 'degrees_north'})},
+        attrs={
+            'title': 'Weather',
+            'valid_range': np.array([180.0, 330.0]),
+            'flags': [1, 2, 4],
+        },
         jax_coords={
-            'lon': np.arange(4) * 10})
+            'lon': xarray.Variable(
+                ('lon',), jnp.arange(4) * 10,
+                attrs={'units': 'degrees_east'})})
     children, aux = xarray_jax.pytree._flatten_dataset(dataset)
     # Check auxiliary info is hashable/comparable (important for jax.jit):
     hash(aux)
     self.assertEqual(aux, aux)
     roundtrip = xarray_jax.pytree._unflatten_dataset(aux, children)
-    self.assertTrue(dataset.equals(roundtrip))
+    self.assertTrue(dataset.identical(roundtrip))
+    xarray.testing.assert_identical(
+        jax.device_get(dataset), jax.device_get(roundtrip))
+
+  def test_attrs_are_part_of_jit_identity(self):
+    kelvin = xarray_jax.DataArray(
+        data=jnp.ones((2,)), dims=('x',), attrs={'units': 'K'})
+    celsius = xarray_jax.DataArray(
+        data=jnp.ones((2,)), dims=('x',), attrs={'units': 'degC'})
+
+    @jax.jit
+    def scale(value):
+      factor = 2 if value.attrs['units'] == 'K' else 3
+      return value.data * factor
+
+    np.testing.assert_array_equal(jax.device_get(scale(kelvin)), [2, 2])
+    np.testing.assert_array_equal(jax.device_get(scale(celsius)), [3, 3])
+
+  def test_dataset_attrs_are_part_of_jit_identity(self):
+    kelvin = xarray_jax.Dataset(
+        {'temperature': (('x',), jnp.ones((2,)))}, attrs={'units': 'K'})
+    celsius = xarray_jax.Dataset(
+        {'temperature': (('x',), jnp.ones((2,)))}, attrs={'units': 'degC'})
+
+    @jax.jit
+    def scale(value):
+      factor = 2 if value.attrs['units'] == 'K' else 3
+      return value['temperature'].data * factor
+
+    np.testing.assert_array_equal(jax.device_get(scale(kelvin)), [2, 2])
+    np.testing.assert_array_equal(jax.device_get(scale(celsius)), [3, 3])
+
+  def test_static_coordinate_attrs_are_part_of_pytree_identity(self):
+    degrees = xarray_jax.DataArray(
+        data=jnp.ones((2,)),
+        dims=('lat',),
+        coords={'lat': xarray.Variable(
+            ('lat',), np.arange(2), attrs={'units': 'degrees_north'})})
+    radians = xarray_jax.DataArray(
+        data=jnp.ones((2,)),
+        dims=('lat',),
+        coords={'lat': xarray.Variable(
+            ('lat',), np.arange(2), attrs={'units': 'radians'})})
+
+    _, degrees_aux = xarray_jax.pytree._flatten_data_array(degrees)
+    _, radians_aux = xarray_jax.pytree._flatten_data_array(radians)
+    self.assertNotEqual(degrees_aux, radians_aux)
+    self.assertNotEqual(degrees_aux[1], radians_aux[1])
+
+    @jax.jit
+    def scale(value):
+      factor = (2 if value.coords['lat'].attrs['units'] == 'degrees_north'
+                else 3)
+      return value.data * factor
+
+    np.testing.assert_array_equal(jax.device_get(scale(degrees)), [2, 2])
+    np.testing.assert_array_equal(jax.device_get(scale(radians)), [3, 3])
 
   def test_flatten_unflatten_datatree(self):
     # Coords to be inherited from the parent dataset, we include one jax
     # coord and one not to check both code paths
     parent_dataset = xarray_jax.Dataset(
         jax_coords={'time': xarray.Variable(('time',), np.arange(2))},
-        coords={'lon': xarray.Variable(('lon',), np.arange(4) * 10)})
+        coords={'lon': xarray.Variable(
+            ('lon',), np.arange(4) * 10,
+            attrs={'units': 'degrees_east'})},
+        attrs={'node': 'parent'})
 
     bar = jnp.ones((2, 3, 4), dtype=np.float32)
     child_dataset = xarray_jax.Dataset(
-        {'bar': (('time', 'lat', 'lon'), bar)},
-        coords={'lat': np.arange(3)})
+        {'bar': xarray.Variable(
+            ('time', 'lat', 'lon'), bar, attrs={'units': 'K'})},
+        coords={'lat': xarray.Variable(
+            ('lat',), np.arange(3), attrs={'units': 'degrees_north'})},
+        attrs={'node': 'child'})
 
     datatree = xarray.DataTree(
         dataset=parent_dataset,
@@ -87,7 +202,7 @@ class PytreeTest(absltest.TestCase):
     hash(aux)
     self.assertEqual(aux, aux)
     roundtrip = xarray_jax.pytree._unflatten_datatree(aux, children)
-    self.assertTrue(datatree.equals(roundtrip))
+    self.assertTrue(datatree.identical(roundtrip))
 
   def test_flatten_unflatten_added_dim(self):
     data_array = xarray_jax.DataArray(
@@ -159,7 +274,8 @@ class NonArrayLeafWrapperTest(parameterized.TestCase):
   )
   def test_preserves_leaf_identity(self, leaf):
     var = xarray.Variable(('x', 'y'), jnp.ones((2, 3)))
-    unflattened_var = xarray_jax.pytree._unflatten_variable(var.dims, (leaf,))
+    _, aux = xarray_jax.pytree._flatten_variable(var)
+    unflattened_var = xarray_jax.pytree._unflatten_variable(aux, (leaf,))
 
     # Preserves leaf identity
     self.assertIsInstance(
@@ -180,8 +296,9 @@ class NonArrayLeafWrapperTest(parameterized.TestCase):
       self, leaf, expected_shape, expected_dtype
   ):
     var = xarray.Variable(('x', 'y'), jnp.ones((2, 3)))
+    _, aux = xarray_jax.pytree._flatten_variable(var)
     unflattened_var = xarray_jax.pytree._unflatten_variable(
-        var.dims, (leaf,)
+        aux, (leaf,)
     )
 
     # Returns a valid xarray object
@@ -196,7 +313,8 @@ class NonArrayLeafWrapperTest(parameterized.TestCase):
   def test_creates_valid_xarray_objects_scalar(self):
     # Ensure shape=() when dims=() and leaf has no shape
     var, leaf = xarray.Variable((), jnp.array(1.0)), 7
-    unflattened_var = xarray_jax.pytree._unflatten_variable(var.dims, (leaf,))
+    _, aux = xarray_jax.pytree._flatten_variable(var)
+    unflattened_var = xarray_jax.pytree._unflatten_variable(aux, (leaf,))
     self.assertEqual(unflattened_var.shape, ())
     self.assertEqual(unflattened_var.dims, var.dims)
     self.assertEqual(unflattened_var.dtype, jnp.int32)
@@ -205,8 +323,9 @@ class NonArrayLeafWrapperTest(parameterized.TestCase):
 
   def test_unsupported_operations_raise_error(self):
     var, leaf = xarray.Variable(('x',), jnp.ones((2,))), 42
+    _, aux = xarray_jax.pytree._flatten_variable(var)
     unflattened_var = xarray_jax.pytree._unflatten_variable(
-        var.dims, (leaf,)
+        aux, (leaf,)
     )
     wrapped_data = unflattened_var.data
 

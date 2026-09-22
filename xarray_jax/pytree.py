@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import xarray
+from xarray.core import utils as xarray_utils
 from xarray_jax import core
 
 
@@ -197,29 +198,34 @@ def dims_change_on_unflatten(dims_change_fn: DimsChangeFn):
     _DIMS_CHANGE_ON_UNFLATTEN_FN.reset(token)
 
 
-def _flatten_variable(v: xarray.Variable) -> Tuple[
-    Tuple[Any], Tuple[Hashable, ...]]:  # pylint: disable=g-one-element-tuple
+def _flatten_variable(
+    v: xarray.Variable,
+) -> Tuple[
+    Tuple[Any],
+    Tuple[Tuple[Hashable, ...], '_HashableAttrs'],
+]:  # pylint: disable=g-one-element-tuple
   """Flattens a Variable for jax.tree_util."""
   children = (unwrap_data(v),)
-  aux = v.dims
+  aux = (v.dims, _HashableAttrs(v.attrs))
   return children, aux
 
 
 def _unflatten_variable(
-    aux: Tuple[Hashable, ...],
-    children: Tuple[Any]) -> xarray.Variable:  # pylint: disable=g-one-element-tuple
+    aux: Tuple[Tuple[Hashable, ...], '_HashableAttrs'],
+    children: Tuple[Any],
+) -> xarray.Variable:  # pylint: disable=g-one-element-tuple
   """Unflattens a Variable for jax.tree_util."""
-  dims = aux
+  dims, attrs = aux
   data = children[0]
 
   dims_change_fn = _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None)
   if dims_change_fn: dims = dims_change_fn(dims)
 
   if isinstance(data, (jax.Array, np.ndarray)):
-    return xarray.Variable(dims=dims, data=data)
+    return xarray.Variable(dims=dims, data=data, attrs=dict(attrs))
   else:
     wrapper = NonArrayLeafWrapper(leaf=data, dims=dims)
-    return xarray.Variable(dims=dims, data=wrapper)
+    return xarray.Variable(dims=dims, data=wrapper, attrs=dict(attrs))
 
 
 def _split_static_and_jax_coords(
@@ -286,8 +292,46 @@ class _HashableCoords(collections.abc.Mapping):
       return True
     else:
       return self._variables.keys() == other._variables.keys() and all(
-          variable.equals(other._variables[name])
+          variable.identical(other._variables[name])
           for name, variable in self._variables.items())
+
+
+class _HashableAttrs(collections.abc.Mapping):
+  """Wraps attrs as hashable static PyTree metadata.
+
+  Attr values are not required to be hashable themselves. The attrs mapping is
+  static PyTree metadata, so callers should not mutate it while relying on the
+  containing PyTree's JAX cache identity.
+  """
+
+  def __init__(self, attrs: Mapping[Any, Any]):
+    self._attrs = dict(attrs)
+    # Attr keys are always hashable because they are dictionary keys. Hashing
+    # only the keys avoids requiring arbitrary attr values to be hashable.
+    self._hash = hash(frozenset(self._attrs))
+
+  def __repr__(self) -> str:
+    return f'_HashableAttrs({repr(self._attrs)})'
+
+  def __getitem__(self, key: Hashable) -> Any:
+    return self._attrs[key]
+
+  def __len__(self) -> int:
+    return len(self._attrs)
+
+  def __iter__(self) -> Iterator[Hashable]:
+    return iter(self._attrs)
+
+  def __hash__(self):
+    return self._hash
+
+  def __eq__(self, other):
+    if self is other:
+      return True
+    elif not isinstance(other, type(self)):
+      return NotImplemented
+    else:
+      return xarray_utils.dict_equiv(self._attrs, other._attrs)
 
 
 def _flatten_data_array(v: xarray.DataArray) -> Tuple[
@@ -319,34 +363,35 @@ def _unflatten_data_array(
     static_coord_vars = _drop_with_none_of_dims(
         static_coord_vars, variable.dims)
   return core.DataArray(
-      variable, name=name, coords=static_coord_vars, jax_coords=jax_coord_vars)
+      variable, name=name, attrs=variable.attrs,
+      coords=static_coord_vars, jax_coords=jax_coord_vars)
 
 
 def _flatten_dataset(dataset: xarray.Dataset) -> Tuple[
     # Children (data variables, jax_coord_vars):
     Tuple[Mapping[Hashable, xarray.Variable],
           Mapping[Hashable, xarray.Variable]],
-    # Static auxiliary data (static_coord_vars):
-    _HashableCoords]:
+    # Static auxiliary data (static_coord_vars, attrs):
+    Tuple[_HashableCoords, _HashableAttrs]]:
   """Flattens a Dataset for jax.tree_util."""
   variables = {name: data_array.variable
                for name, data_array in dataset.data_vars.items()}
   static_coord_vars, jax_coord_vars = _split_static_and_jax_coords(
       dataset.coords)
   children = (variables, jax_coord_vars)
-  aux = _HashableCoords(static_coord_vars)
+  aux = (_HashableCoords(static_coord_vars), _HashableAttrs(dataset.attrs))
   return children, aux
 
 
 def _unflatten_dataset(
-    aux: _HashableCoords,
+    aux: Tuple[_HashableCoords, _HashableAttrs],
     children: Tuple[Mapping[Hashable, xarray.Variable],
                     Mapping[Hashable, xarray.Variable]],
     ) -> xarray.Dataset:
   """Unflattens a Dataset for jax.tree_util."""
   data_vars, jax_coord_vars = children
-  static_coord_vars = aux
-  dataset = xarray.Dataset(data_vars)
+  static_coord_vars, attrs = aux
+  dataset = xarray.Dataset(data_vars, attrs=dict(attrs))
   if _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None):
     # Drop static coords which have dims not present in any of the data_vars.
     # See corresponding comment in _unflatten_data_array.
