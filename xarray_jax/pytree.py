@@ -198,19 +198,26 @@ def dims_change_on_unflatten(dims_change_fn: DimsChangeFn):
     _DIMS_CHANGE_ON_UNFLATTEN_FN.reset(token)
 
 
-def _attrs_equiv(first: Any, second: Any) -> bool:
-  """Compares attr values using xarray equivalence semantics."""
+def _metadata_equiv(first: Any, second: Any) -> bool:
+  """Compares static metadata values using xarray equivalence semantics."""
   first_is_mapping = isinstance(first, collections.abc.Mapping)
   second_is_mapping = isinstance(second, collections.abc.Mapping)
   if first_is_mapping or second_is_mapping:
     if not first_is_mapping or not second_is_mapping:
       return False
-    return xarray_utils.dict_equiv(first, second, compat=_attrs_equiv)
+    return xarray_utils.dict_equiv(first, second, compat=_metadata_equiv)
 
   # Let xarray handle NumPy arrays (including array-vs-list comparisons)
   # before recursively handling sequences that may contain arrays.
   if isinstance(first, np.ndarray) or isinstance(second, np.ndarray):
     return xarray_utils.equivalent(first, second)
+
+  first_is_set = isinstance(first, (set, frozenset))
+  second_is_set = isinstance(second, (set, frozenset))
+  if first_is_set or second_is_set:
+    if not first_is_set or not second_is_set:
+      return False
+    return first == second
 
   first_is_sequence = isinstance(first, (list, tuple))
   second_is_sequence = isinstance(second, (list, tuple))
@@ -219,35 +226,35 @@ def _attrs_equiv(first: Any, second: Any) -> bool:
       return False
     if len(first) != len(second):
       return False
-    return all(_attrs_equiv(a, b) for a, b in zip(first, second))
+    return all(_metadata_equiv(a, b) for a, b in zip(first, second))
 
   return xarray_utils.equivalent(first, second)
 
 
-class _HashableAttrs(collections.abc.Mapping):
-  """Wraps attrs as hashable static PyTree metadata.
+class _HashableMapping(collections.abc.Mapping):
+  """Wraps a mapping as hashable static PyTree metadata.
 
-  The attrs mapping is shallow-snapshotted. Nested mutable values are expected
-  not to be mutated while the wrapper is used as static JAX metadata.
+  The mapping is shallow-snapshotted. Nested mutable values are expected not
+  to be mutated while the wrapper is used as static JAX metadata.
   """
 
-  def __init__(self, attrs: Mapping[Any, Any]):
-    self._attrs = dict(attrs)
-    # Attr keys are always hashable because they are dictionary keys. Hashing
-    # only the keys avoids requiring arbitrary attr values to be hashable.
-    self._hash = hash(frozenset(self._attrs))
+  def __init__(self, mapping: Mapping[Any, Any]):
+    self._mapping = dict(mapping)
+    # Mapping keys are always hashable because they are dictionary keys.
+    # Hashing only the keys avoids requiring arbitrary values to be hashable.
+    self._hash = hash(frozenset(self._mapping))
 
   def __repr__(self) -> str:
-    return f'_HashableAttrs({repr(self._attrs)})'
+    return f'{type(self).__name__}({self._mapping!r})'
 
   def __getitem__(self, key: Hashable) -> Any:
-    return self._attrs[key]
+    return self._mapping[key]
 
   def __len__(self) -> int:
-    return len(self._attrs)
+    return len(self._mapping)
 
   def __iter__(self) -> Iterator[Hashable]:
-    return iter(self._attrs)
+    return iter(self._mapping)
 
   def __hash__(self):
     return self._hash
@@ -258,12 +265,21 @@ class _HashableAttrs(collections.abc.Mapping):
     elif not isinstance(other, type(self)):
       return NotImplemented
     else:
-      return _attrs_equiv(self._attrs, other._attrs)
+      return _metadata_equiv(self._mapping, other._mapping)
+
+
+class _HashableAttrs(_HashableMapping):
+  """Wraps attrs as hashable static PyTree metadata."""
+
+
+class _HashableEncoding(_HashableMapping):
+  """Wraps encoding as hashable static PyTree metadata."""
 
 
 _VariableAux = Tuple[
     Tuple[Hashable, ...],
     _HashableAttrs,
+    _HashableEncoding,
 ]
 
 
@@ -272,7 +288,7 @@ def _flatten_variable(
 ) -> Tuple[Tuple[Any], _VariableAux]:  # pylint: disable=g-one-element-tuple
   """Flattens a Variable for jax.tree_util."""
   children = (unwrap_data(v),)
-  aux = (v.dims, _HashableAttrs(v.attrs))
+  aux = (v.dims, _HashableAttrs(v.attrs), _HashableEncoding(v.encoding))
   return children, aux
 
 
@@ -281,17 +297,19 @@ def _unflatten_variable(
     children: Tuple[Any],
 ) -> xarray.Variable:  # pylint: disable=g-one-element-tuple
   """Unflattens a Variable for jax.tree_util."""
-  dims, attrs = aux
+  dims, attrs, encoding = aux
   data = children[0]
 
   dims_change_fn = _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None)
   if dims_change_fn: dims = dims_change_fn(dims)
 
   if isinstance(data, (jax.Array, np.ndarray)):
-    return xarray.Variable(dims=dims, data=data, attrs=dict(attrs))
+    return xarray.Variable(
+        dims=dims, data=data, attrs=dict(attrs), encoding=dict(encoding))
   else:
     wrapper = NonArrayLeafWrapper(leaf=data, dims=dims)
-    return xarray.Variable(dims=dims, data=wrapper, attrs=dict(attrs))
+    return xarray.Variable(
+        dims=dims, data=wrapper, attrs=dict(attrs), encoding=dict(encoding))
 
 
 def _split_static_and_jax_coords(
@@ -358,11 +376,12 @@ class _HashableCoords(collections.abc.Mapping):
       return True
     else:
       return self._variables.keys() == other._variables.keys() and all(
-          variable.identical(other._variables[name])
+          variable.identical(other._variables[name]) and _metadata_equiv(
+              variable.encoding, other._variables[name].encoding)
           for name, variable in self._variables.items())
 
 
-_DatasetAux = Tuple[_HashableCoords, _HashableAttrs]
+_DatasetAux = Tuple[_HashableCoords, _HashableAttrs, _HashableEncoding]
 
 
 def _flatten_data_array(v: xarray.DataArray) -> Tuple[
@@ -393,16 +412,18 @@ def _unflatten_data_array(
     # to do this for jax_coords.
     static_coord_vars = _drop_with_none_of_dims(
         static_coord_vars, variable.dims)
-  return core.DataArray(
+  data_array = core.DataArray(
       variable, name=name, attrs=dict(variable.attrs),
       coords=static_coord_vars, jax_coords=jax_coord_vars)
+  data_array.variable.encoding = dict(variable.encoding)
+  return data_array
 
 
 def _flatten_dataset(dataset: xarray.Dataset) -> Tuple[
     # Children (data variables, jax_coord_vars):
     Tuple[Mapping[Hashable, xarray.Variable],
           Mapping[Hashable, xarray.Variable]],
-    # Static auxiliary data (static_coord_vars, attrs):
+    # Static auxiliary data (static_coord_vars, attrs, encoding):
     _DatasetAux]:
   """Flattens a Dataset for jax.tree_util."""
   variables = {name: data_array.variable
@@ -410,7 +431,11 @@ def _flatten_dataset(dataset: xarray.Dataset) -> Tuple[
   static_coord_vars, jax_coord_vars = _split_static_and_jax_coords(
       dataset.coords)
   children = (variables, jax_coord_vars)
-  aux = (_HashableCoords(static_coord_vars), _HashableAttrs(dataset.attrs))
+  aux = (
+      _HashableCoords(static_coord_vars),
+      _HashableAttrs(dataset.attrs),
+      _HashableEncoding(dataset.encoding),
+  )
   return children, aux
 
 
@@ -421,15 +446,17 @@ def _unflatten_dataset(
     ) -> xarray.Dataset:
   """Unflattens a Dataset for jax.tree_util."""
   data_vars, jax_coord_vars = children
-  static_coord_vars, attrs = aux
+  static_coord_vars, attrs, encoding = aux
   dataset = xarray.Dataset(data_vars, attrs=dict(attrs))
   if _DIMS_CHANGE_ON_UNFLATTEN_FN.get(None):
     # Drop static coords which have dims not present in any of the data_vars.
     # See corresponding comment in _unflatten_data_array.
     static_coord_vars = _drop_with_none_of_dims(
         static_coord_vars, dataset.dims)  # pytype: disable=wrong-arg-types
-  return core.assign_coords(
+  dataset = core.assign_coords(
       dataset, coords=static_coord_vars, jax_coords=jax_coord_vars)
+  dataset.encoding = dict(encoding)
+  return dataset
 
 
 def _flatten_datatree(datatree: xarray.DataTree) -> Tuple[

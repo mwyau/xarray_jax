@@ -31,13 +31,21 @@ class PytreeTest(absltest.TestCase):
         'valid_range': np.array([180.0, 330.0]),
     }
     variable = xarray.Variable(
-        ('lat', 'lon'), jnp.ones((3, 4), dtype=np.float32), attrs=attrs)
+        ('lat', 'lon'), jnp.ones((3, 4), dtype=np.float32), attrs=attrs,
+        encoding={
+            'dtype': np.dtype('float32'),
+            '_FillValue': np.float32(-9999.0),
+            'scale_factor': np.float32(0.01),
+            'chunksizes': (181, 360),
+        })
     children, aux = xarray_jax.pytree._flatten_variable(variable)
     # Check auxiliary info is hashable/comparable (important for jax.jit):
     hash(aux)
     self.assertEqual(aux, aux)
     roundtrip = xarray_jax.pytree._unflatten_variable(aux, children)
     self.assertTrue(variable.identical(roundtrip))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        variable.encoding, roundtrip.encoding))
 
   def test_hashable_attrs_array_aware_equality(self):
     attrs = {
@@ -102,6 +110,39 @@ class PytreeTest(absltest.TestCase):
     hash(wrapped1)
     hash(wrapped2)
 
+  def test_hashable_encoding_supports_common_values(self):
+    encoding = {
+        'dtype': np.dtype('float32'),
+        '_FillValue': np.float32(-9999.0),
+        'chunksizes': (181, 360),
+        'filters': {'zlib': True, 'levels': [1, 2]},
+        'unlimited_dims': {'time'},
+    }
+    equal_encoding = {
+        'dtype': np.dtype('float32'),
+        '_FillValue': np.float32(-9999.0),
+        'chunksizes': (181, 360),
+        'filters': {'zlib': True, 'levels': [1, 2]},
+        'unlimited_dims': {'time'},
+    }
+    different_encoding = {
+        'dtype': np.dtype('float32'),
+        '_FillValue': np.float32(-9999.0),
+        'chunksizes': (181, 360),
+        'filters': {'zlib': True, 'levels': [1, 3]},
+        'unlimited_dims': {'time'},
+    }
+
+    wrapped = xarray_jax.pytree._HashableEncoding(encoding)
+    equal = xarray_jax.pytree._HashableEncoding(equal_encoding)
+    different = xarray_jax.pytree._HashableEncoding(different_encoding)
+
+    self.assertEqual(wrapped, equal)
+    self.assertNotEqual(wrapped, different)
+    self.assertEqual(hash(wrapped), hash(equal))
+    hash(wrapped)
+    hash(equal)
+
   def test_flatten_unflatten_data_array(self):
     data_array = xarray_jax.DataArray(
         data=jnp.ones((3, 4), dtype=np.float32),
@@ -110,12 +151,18 @@ class PytreeTest(absltest.TestCase):
         attrs={'standard_name': 'air_temperature', 'units': 'K'},
         coords={
             'lat': xarray.Variable(
-                ('lat',), np.arange(3), attrs={'units': 'degrees_north'})},
+                ('lat',), np.arange(3), attrs={'units': 'degrees_north'},
+                encoding={'dtype': np.dtype('int32')})},
         jax_coords={
             'lon': xarray.Variable(
                 ('lon',), jnp.arange(4) * 10,
-                attrs={'units': 'degrees_east'})},
+                attrs={'units': 'degrees_east'},
+                encoding={'dtype': np.dtype('int32')})},
     )
+    data_array.variable.encoding = {
+        'dtype': np.dtype('float32'),
+        '_FillValue': np.float32(-9999.0),
+    }
     children, aux = xarray_jax.pytree._flatten_data_array(data_array)
     # Check auxiliary info is hashable/comparable (important for jax.jit):
     hash(aux)
@@ -124,6 +171,16 @@ class PytreeTest(absltest.TestCase):
     self.assertTrue(data_array.identical(roundtrip))
     xarray.testing.assert_identical(
         jax.device_get(data_array), jax.device_get(roundtrip))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        data_array.encoding, roundtrip.encoding))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        data_array.coords['lat'].encoding,
+        roundtrip.coords['lat'].encoding))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        data_array.coords['lon'].encoding,
+        roundtrip.coords['lon'].encoding))
+    self.assertIsInstance(
+        data_array.coords['lat'].variable, xarray.IndexVariable)
 
   def test_flatten_unflatten_dataset(self):
     foo = jnp.ones((3, 4), dtype=np.float32)
@@ -131,16 +188,25 @@ class PytreeTest(absltest.TestCase):
     dataset = xarray_jax.Dataset(
         data_vars={
             'foo': xarray.Variable(
-                ('lat', 'lon'), foo, attrs={'units': 'K'}),
+                ('lat', 'lon'), foo, attrs={'units': 'K'},
+                encoding={'dtype': np.dtype('float32'),
+                          '_FillValue': np.float32(-9999.0)}),
             'bar': xarray.Variable(
                 ('time', 'lat', 'lon'), bar,
-                attrs={'standard_name': 'air_temperature'})},
+                attrs={'standard_name': 'air_temperature'},
+                encoding={'dtype': np.dtype('float32'),
+                          'scale_factor': np.float32(0.01)})},
         coords={
             'time': xarray.Variable(
-                ('time',), np.arange(2), attrs={'axis': 'T'}),
+                ('time',), np.arange(2), attrs={'axis': 'T'},
+                encoding={
+                    'units': 'hours since 2000-01-01 00:00:00',
+                    'calendar': 'proleptic_gregorian',
+                }),
             'lat': xarray.Variable(
                 ('lat',), np.arange(3) * 10,
-                attrs={'units': 'degrees_north'})},
+                attrs={'units': 'degrees_north'},
+                encoding={'dtype': np.dtype('int32')})},
         attrs={
             'title': 'Weather',
             'valid_range': np.array([180.0, 330.0]),
@@ -149,7 +215,12 @@ class PytreeTest(absltest.TestCase):
         jax_coords={
             'lon': xarray.Variable(
                 ('lon',), jnp.arange(4) * 10,
-                attrs={'units': 'degrees_east'})})
+                attrs={'units': 'degrees_east'},
+                encoding={'dtype': np.dtype('int32')})})
+    dataset.encoding = {
+        'source': 'example.nc',
+        'unlimited_dims': {'time'},
+    }
     children, aux = xarray_jax.pytree._flatten_dataset(dataset)
     # Check auxiliary info is hashable/comparable (important for jax.jit):
     hash(aux)
@@ -158,6 +229,69 @@ class PytreeTest(absltest.TestCase):
     self.assertTrue(dataset.identical(roundtrip))
     xarray.testing.assert_identical(
         jax.device_get(dataset), jax.device_get(roundtrip))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        dataset.encoding, roundtrip.encoding))
+    for name, variable in dataset.variables.items():
+      self.assertTrue(xarray_jax.pytree._metadata_equiv(
+          variable.encoding, roundtrip.variables[name].encoding), name)
+
+  def test_cf_metadata_roundtrip(self):
+    time = xarray.Variable(
+        ('time',), np.array(
+            ['2000-01-01', '2000-01-02'], dtype='datetime64[ns]'),
+        attrs={'standard_name': 'time', 'axis': 'T'},
+        encoding={
+            'units': 'hours since 2000-01-01 00:00:00',
+            'calendar': 'proleptic_gregorian',
+        })
+    latitude = xarray.Variable(
+        ('lat',), np.array([-90.0, 90.0], dtype=np.float32),
+        attrs={
+            'standard_name': 'latitude',
+            'units': 'degrees_north',
+            'axis': 'Y',
+        },
+        encoding={'dtype': np.dtype('float32')})
+    longitude = xarray.Variable(
+        ('lon',), np.array([0.0, 120.0, 240.0], dtype=np.float32),
+        attrs={
+            'standard_name': 'longitude',
+            'units': 'degrees_east',
+            'axis': 'X',
+        },
+        encoding={'dtype': np.dtype('float32')})
+    temperature = xarray.Variable(
+        ('time', 'lat', 'lon'),
+        jnp.arange(12, dtype=jnp.float32).reshape((2, 2, 3)),
+        attrs={
+            'standard_name': 'air_temperature',
+            'long_name': 'Air temperature',
+            'units': 'K',
+        },
+        encoding={
+            'dtype': np.dtype('float32'),
+            '_FillValue': np.float32(-9999.0),
+            'scale_factor': np.float32(0.01),
+        })
+    dataset = xarray_jax.Dataset(
+        data_vars={'temperature': temperature},
+        coords={'time': time, 'lat': latitude, 'lon': longitude},
+        attrs={'Conventions': 'CF-1.11', 'title': 'Test temperatures'})
+    dataset.encoding = {
+        'source': 'example.nc',
+        'unlimited_dims': {'time'},
+    }
+
+    leaves, treedef = jax.tree_util.tree_flatten(dataset)
+    roundtrip = jax.tree_util.tree_unflatten(treedef, leaves)
+
+    xarray.testing.assert_identical(
+        jax.device_get(dataset), jax.device_get(roundtrip))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        dataset.encoding, roundtrip.encoding))
+    for name, variable in dataset.variables.items():
+      self.assertTrue(xarray_jax.pytree._metadata_equiv(
+          variable.encoding, roundtrip.variables[name].encoding), name)
 
   def test_attrs_are_part_of_jit_identity(self):
     kelvin = xarray_jax.DataArray(
@@ -173,6 +307,23 @@ class PytreeTest(absltest.TestCase):
     np.testing.assert_array_equal(jax.device_get(scale(kelvin)), [2, 2])
     np.testing.assert_array_equal(jax.device_get(scale(celsius)), [3, 3])
 
+  def test_encoding_is_part_of_jit_identity(self):
+    float32 = xarray_jax.DataArray(
+        data=jnp.ones((2,)), dims=('x',))
+    float32.variable.encoding = {'dtype': np.dtype('float32')}
+    int16 = xarray_jax.DataArray(
+        data=jnp.ones((2,)), dims=('x',))
+    int16.variable.encoding = {'dtype': np.dtype('int16')}
+
+    @jax.jit
+    def scale(value):
+      factor = (2 if value.encoding['dtype'] == np.dtype('float32')
+                else 3)
+      return value.data * factor
+
+    np.testing.assert_array_equal(jax.device_get(scale(float32)), [2, 2])
+    np.testing.assert_array_equal(jax.device_get(scale(int16)), [3, 3])
+
   def test_dataset_attrs_are_part_of_jit_identity(self):
     kelvin = xarray_jax.Dataset(
         {'temperature': (('x',), jnp.ones((2,)))}, attrs={'units': 'K'})
@@ -186,6 +337,22 @@ class PytreeTest(absltest.TestCase):
 
     np.testing.assert_array_equal(jax.device_get(scale(kelvin)), [2, 2])
     np.testing.assert_array_equal(jax.device_get(scale(celsius)), [3, 3])
+
+  def test_dataset_encoding_is_part_of_jit_identity(self):
+    first = xarray_jax.Dataset(
+        {'temperature': (('x',), jnp.ones((2,)))})
+    first.encoding = {'source': 'first.nc'}
+    second = xarray_jax.Dataset(
+        {'temperature': (('x',), jnp.ones((2,)))})
+    second.encoding = {'source': 'second.nc'}
+
+    @jax.jit
+    def scale(value):
+      factor = 2 if value.encoding['source'] == 'first.nc' else 3
+      return value['temperature'].data * factor
+
+    np.testing.assert_array_equal(jax.device_get(scale(first)), [2, 2])
+    np.testing.assert_array_equal(jax.device_get(scale(second)), [3, 3])
 
   def test_static_coordinate_attrs_are_part_of_pytree_identity(self):
     degrees = xarray_jax.DataArray(
@@ -213,6 +380,33 @@ class PytreeTest(absltest.TestCase):
     np.testing.assert_array_equal(jax.device_get(scale(degrees)), [2, 2])
     np.testing.assert_array_equal(jax.device_get(scale(radians)), [3, 3])
 
+  def test_static_coordinate_encoding_is_part_of_pytree_identity(self):
+    standard = xarray_jax.DataArray(
+        data=jnp.ones((2,)),
+        dims=('time',),
+        coords={'time': xarray.Variable(
+            ('time',), np.arange(2), attrs={'axis': 'T'},
+            encoding={'calendar': 'standard'})})
+    noleap = xarray_jax.DataArray(
+        data=jnp.ones((2,)),
+        dims=('time',),
+        coords={'time': xarray.Variable(
+            ('time',), np.arange(2), attrs={'axis': 'T'},
+            encoding={'calendar': 'noleap'})})
+
+    _, standard_aux = xarray_jax.pytree._flatten_data_array(standard)
+    _, noleap_aux = xarray_jax.pytree._flatten_data_array(noleap)
+    self.assertNotEqual(standard_aux, noleap_aux)
+
+    @jax.jit
+    def scale(value):
+      factor = (2 if value.coords['time'].encoding['calendar'] == 'standard'
+                else 3)
+      return value.data * factor
+
+    np.testing.assert_array_equal(jax.device_get(scale(standard)), [2, 2])
+    np.testing.assert_array_equal(jax.device_get(scale(noleap)), [3, 3])
+
   def test_flatten_unflatten_datatree(self):
     # Coords to be inherited from the parent dataset, we include one jax
     # coord and one not to check both code paths
@@ -222,14 +416,20 @@ class PytreeTest(absltest.TestCase):
             ('lon',), np.arange(4) * 10,
             attrs={'units': 'degrees_east'})},
         attrs={'node': 'parent'})
+    parent_dataset.encoding = {
+        'source': 'parent.nc',
+        'unlimited_dims': {'time'},
+    }
 
     bar = jnp.ones((2, 3, 4), dtype=np.float32)
     child_dataset = xarray_jax.Dataset(
         {'bar': xarray.Variable(
-            ('time', 'lat', 'lon'), bar, attrs={'units': 'K'})},
+            ('time', 'lat', 'lon'), bar, attrs={'units': 'K'},
+            encoding={'dtype': np.dtype('float32')})},
         coords={'lat': xarray.Variable(
             ('lat',), np.arange(3), attrs={'units': 'degrees_north'})},
         attrs={'node': 'child'})
+    child_dataset.encoding = {'source': 'child.nc'}
 
     datatree = xarray.DataTree(
         dataset=parent_dataset,
@@ -241,6 +441,15 @@ class PytreeTest(absltest.TestCase):
     self.assertEqual(aux, aux)
     roundtrip = xarray_jax.pytree._unflatten_datatree(aux, children)
     self.assertTrue(datatree.identical(roundtrip))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        parent_dataset.encoding,
+        roundtrip.to_dataset(inherit=False).encoding))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        child_dataset.encoding,
+        roundtrip.children['child'].to_dataset(inherit=False).encoding))
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        child_dataset['bar'].encoding,
+        roundtrip.children['child'].to_dataset(inherit=False)['bar'].encoding))
 
   def test_flatten_unflatten_added_dim(self):
     data_array = xarray_jax.DataArray(
@@ -311,7 +520,9 @@ class NonArrayLeafWrapperTest(parameterized.TestCase):
       ]
   )
   def test_preserves_leaf_identity(self, leaf):
-    var = xarray.Variable(('x', 'y'), jnp.ones((2, 3)))
+    var = xarray.Variable(
+        ('x', 'y'), jnp.ones((2, 3)),
+        encoding={'dtype': np.dtype('float32')})
     _, aux = xarray_jax.pytree._flatten_variable(var)
     unflattened_var = xarray_jax.pytree._unflatten_variable(aux, (leaf,))
 
@@ -320,6 +531,8 @@ class NonArrayLeafWrapperTest(parameterized.TestCase):
         unflattened_var.data, xarray_jax.NonArrayLeafWrapper
     )
     self.assertIs(unflattened_var.data.leaf, leaf)
+    self.assertTrue(xarray_jax.pytree._metadata_equiv(
+        var.encoding, unflattened_var.encoding))
 
   @parameterized.named_parameters(
       ('int', 42, (0, 0), np.int32),
